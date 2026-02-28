@@ -1,10 +1,11 @@
 /*
  * blackbox_redact — GPS location redaction for INAV blackbox logs
  *
- * Replaces GPS_home coordinates in all binary H-frames with randomly
- * offset values. G-frames (GPS tracks) are left untouched because they
- * encode position as a delta from GPS_home (predictor=7), so their
- * decoded positions shift automatically when home changes.
+ * Replaces GPS_home coordinates in all binary H-frames with offset
+ * values (random or user-specified). G-frames (GPS tracks) are left
+ * untouched because they encode position as a delta from GPS_home
+ * (predictor=7), so their decoded positions shift automatically when
+ * home changes.
  *
  * Also patches any "H waypoint[N]:lat,lon,..." text header lines if present.
  *
@@ -15,7 +16,7 @@
  * (1 type byte + 5 lat bytes + 5 lon bytes) is therefore always valid
  * regardless of the original frame size.
  *
- * Usage: blackbox_redact <input.TXT> <output.TXT>
+ * Usage: blackbox_redact [options] <input.TXT> <output.TXT>
  */
 
 #include <stdint.h>
@@ -28,6 +29,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <limits.h>
+#include <getopt.h>
 
 #ifndef WIN32
 #include <unistd.h>
@@ -46,6 +48,16 @@
 /* Maximum text header line length */
 #define MAX_LINE_LEN 4096
 
+/* Random offset limits — latitude is consistent (~111 km/deg everywhere),
+ * so a wider range is fine. Longitude varies with latitude (shrinks toward
+ * poles), so keep it smaller to avoid obvious curvature distortion. */
+#define MAX_RANDOM_LAT_DEG 15.0
+#define MAX_RANDOM_LON_DEG 10.0
+
+/* Minimum random offset — must move at least this far to be useful */
+#define MIN_RANDOM_LAT_DEG  3.0
+#define MIN_RANDOM_LON_DEG  1.0
+
 typedef struct {
     size_t  offset;  /* absolute byte offset from start of file */
     size_t  size;    /* frame length in bytes, including the 'H' type byte */
@@ -58,6 +70,26 @@ static int          h_frame_count = 0;
 static size_t       binary_start_offset = SIZE_MAX; /* offset of first binary frame */
 
 static uint8_t io_buf[IO_BUF_SIZE];
+
+/*
+ * Normalize latitude to ±90° (clamp) and longitude to ±180° (wrap).
+ * Values are in degrees * 1e7.
+ */
+static int32_t normalize_lat(int64_t lat)
+{
+    if (lat >  900000000LL) lat =  900000000LL;
+    if (lat < -900000000LL) lat = -900000000LL;
+    return (int32_t)lat;
+}
+
+static int32_t normalize_lon(int64_t lon)
+{
+    /* Wrap into (-180°, +180°] range */
+    lon = ((lon + 1800000000LL) % 3600000000LL);
+    if (lon < 0) lon += 3600000000LL;
+    lon -= 1800000000LL;
+    return (int32_t)lon;
+}
 
 /*
  * flightLogParse callback — invoked for every decoded frame.
@@ -125,30 +157,93 @@ static int compare_offset(const void *a, const void *b)
  * Waypoint header format: "H waypoint[N]:lat,lon,..."
  */
 static void process_text_line(const char *line, size_t len, FILE *out,
-                              int32_t lat_offset, int32_t lon_offset)
+                              int64_t lat_offset, int64_t lon_offset)
 {
     if (strncmp(line, "H waypoint[", 11) == 0) {
         int n, rest_pos;
         int32_t lat, lon;
         if (sscanf(line, "H waypoint[%d]:%d,%d%n", &n, &lat, &lon, &rest_pos) >= 3) {
+            int32_t new_lat = normalize_lat((int64_t)lat + lat_offset);
+            int32_t new_lon = normalize_lon((int64_t)lon + lon_offset);
             fprintf(out, "H waypoint[%d]:%d,%d%s",
-                    n, lat + lat_offset, lon + lon_offset,
-                    line + rest_pos);
+                    n, new_lat, new_lon, line + rest_pos);
             return;
         }
     }
     fwrite(line, 1, len, out);
 }
 
+static void print_usage(const char *prog)
+{
+    fprintf(stderr,
+        "Usage: %s [options] <input.TXT> <output.TXT>\n"
+        "\n"
+        "Redact GPS location from INAV blackbox logs by offsetting coordinates.\n"
+        "\n"
+        "Options:\n"
+        "  --delta-lat <degrees>  Latitude offset in degrees (default: random)\n"
+        "  --delta-lon <degrees>  Longitude offset in degrees (default: random)\n"
+        "  --help                 Show this help message\n"
+        "\n"
+        "If neither --delta-lat nor --delta-lon is specified, a random offset\n"
+        "is generated (±%.0f° lat, ±%.0f° lon). If only one is specified,\n"
+        "the other defaults to 0.\n",
+        prog, MAX_RANDOM_LAT_DEG, MAX_RANDOM_LON_DEG);
+}
+
 int main(int argc, char **argv)
 {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <input.TXT> <output.TXT>\n", argv[0]);
+    double user_lat_deg = 0.0;
+    double user_lon_deg = 0.0;
+    bool   have_user_lat = false;
+    bool   have_user_lon = false;
+
+    static struct option long_options[] = {
+        {"delta-lat", required_argument, NULL, 'a'},
+        {"delta-lon", required_argument, NULL, 'o'},
+        {"help",      no_argument,       NULL, 'h'},
+        {NULL,        0,                 NULL,  0 }
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "h", long_options, NULL)) != -1) {
+        switch (opt) {
+        case 'a':
+            user_lat_deg = atof(optarg);
+            have_user_lat = true;
+            break;
+        case 'o':
+            user_lon_deg = atof(optarg);
+            have_user_lon = true;
+            break;
+        case 'h':
+            print_usage(argv[0]);
+            return 0;
+        default:
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
+
+    /* Validate user-supplied offsets */
+    if (have_user_lat && (user_lat_deg < -180.0 || user_lat_deg > 180.0)) {
+        fprintf(stderr, "Error: --delta-lat must be between -180 and 180\n");
+        return 1;
+    }
+    if (have_user_lon && (user_lon_deg < -180.0 || user_lon_deg > 180.0)) {
+        fprintf(stderr, "Error: --delta-lon must be between -180 and 180\n");
         return 1;
     }
 
-    const char *input_path  = argv[1];
-    const char *output_path = argv[2];
+    /* After option parsing, expect exactly 2 positional args */
+    if (argc - optind != 2) {
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    const char *input_path  = argv[optind];
+    const char *output_path = argv[optind + 1];
+    bool use_user_offset = have_user_lat || have_user_lon;
 
     platform_init();
 
@@ -195,35 +290,42 @@ int main(int argc, char **argv)
     qsort(h_frames, h_frame_count, sizeof(HFrameRecord), compare_offset);
 
     /* ------------------------------------------------------------------ *
-     * Compute a random relocation offset from the first home position     *
+     * Compute relocation offset                                           *
      * ------------------------------------------------------------------ */
 
-    srand((unsigned int)time(NULL));
+    double lat_off_deg, lon_off_deg;
+
+    if (use_user_offset) {
+        lat_off_deg = user_lat_deg;
+        lon_off_deg = user_lon_deg;
+    } else {
+        srand((unsigned int)time(NULL));
+
+        /* Generate random offset within ±MAX_RANDOM_{LAT,LON}_DEG,
+         * but ensure at least ±MIN_RANDOM_{LAT,LON}_DEG for privacy */
+        double lat_sign = (rand() % 2) ? 1.0 : -1.0;
+        double lon_sign = (rand() % 2) ? 1.0 : -1.0;
+        lat_off_deg = lat_sign * (MIN_RANDOM_LAT_DEG +
+                      (double)rand() / RAND_MAX * (MAX_RANDOM_LAT_DEG - MIN_RANDOM_LAT_DEG));
+        lon_off_deg = lon_sign * (MIN_RANDOM_LON_DEG +
+                      (double)rand() / RAND_MAX * (MAX_RANDOM_LON_DEG - MIN_RANDOM_LON_DEG));
+    }
+
+    int64_t lat_offset = (int64_t)round(lat_off_deg * 1e7);
+    int64_t lon_offset = (int64_t)round(lon_off_deg * 1e7);
 
     double home_lat_deg = h_frames[0].lat / 1e7;
     double home_lon_deg = h_frames[0].lon / 1e7;
 
-    /* Clamp lat result to ±80° — avoid polar regions */
-    double lat_min_deg =  -80.0 - home_lat_deg;
-    double lat_max_deg =   80.0 - home_lat_deg;
-
-    /* Keep lon offset within ±150° to avoid meridian-wrap edge cases */
-    double lon_min_deg = -150.0;
-    double lon_max_deg =  150.0;
-
-    double lat_off_deg = lat_min_deg + (double)rand() / RAND_MAX * (lat_max_deg - lat_min_deg);
-    double lon_off_deg = lon_min_deg + (double)rand() / RAND_MAX * (lon_max_deg - lon_min_deg);
-
-    int32_t lat_offset = (int32_t)round(lat_off_deg * 1e7);
-    int32_t lon_offset = (int32_t)round(lon_off_deg * 1e7);
+    int32_t redacted_lat = normalize_lat((int64_t)h_frames[0].lat + lat_offset);
+    int32_t redacted_lon = normalize_lon((int64_t)h_frames[0].lon + lon_offset);
 
     fprintf(stderr, "Original home:  lat=%11.7f  lon=%12.7f\n",
             home_lat_deg, home_lon_deg);
     fprintf(stderr, "Applied offset: lat%+11.7f  lon%+12.7f\n",
             lat_off_deg, lon_off_deg);
     fprintf(stderr, "Redacted home:  lat=%11.7f  lon=%12.7f\n",
-            (h_frames[0].lat + lat_offset) / 1e7,
-            (h_frames[0].lon + lon_offset) / 1e7);
+            redacted_lat / 1e7, redacted_lon / 1e7);
 
     /* ------------------------------------------------------------------ *
      * Phase 2: copy file with targeted patches                            *
@@ -245,6 +347,7 @@ int main(int argc, char **argv)
     /* --- 2a. Text header section: process line by line ------------------- */
     size_t text_end  = (binary_start_offset == SIZE_MAX) ? 0 : binary_start_offset;
     size_t text_pos  = 0;
+    bool   relocated_header_written = false;
 
     {
         char   line[MAX_LINE_LEN];
@@ -258,6 +361,13 @@ int main(int argc, char **argv)
 
             if (c == '\n' || line_len == sizeof(line) - 1) {
                 line[line_len] = '\0';
+
+                /* Insert "H Relocated:1" before the first non-header line */
+                if (!relocated_header_written && line[0] != 'H') {
+                    fprintf(fout, "H Relocated:1\n");
+                    relocated_header_written = true;
+                }
+
                 process_text_line(line, line_len, fout, lat_offset, lon_offset);
                 line_len = 0;
             }
@@ -266,7 +376,17 @@ int main(int argc, char **argv)
         /* Flush any line not terminated by '\n' */
         if (line_len > 0) {
             line[line_len] = '\0';
+            if (!relocated_header_written && line[0] != 'H') {
+                fprintf(fout, "H Relocated:1\n");
+                relocated_header_written = true;
+            }
             process_text_line(line, line_len, fout, lat_offset, lon_offset);
+        }
+
+        /* If all lines were headers, insert at the end of the text section */
+        if (!relocated_header_written) {
+            fprintf(fout, "H Relocated:1\n");
+            relocated_header_written = true;
         }
     }
 
@@ -308,11 +428,14 @@ int main(int argc, char **argv)
         }
         current_pos += h_frames[i].size;
 
-        /* Write replacement 11-byte H-frame */
+        /* Write replacement 11-byte H-frame with normalized coordinates */
+        int32_t new_lat = normalize_lat((int64_t)h_frames[i].lat + lat_offset);
+        int32_t new_lon = normalize_lon((int64_t)h_frames[i].lon + lon_offset);
+
         uint8_t new_frame[11];
         new_frame[0] = 'H';
-        encode_signed_vb5(h_frames[i].lat + lat_offset, &new_frame[1]);
-        encode_signed_vb5(h_frames[i].lon + lon_offset, &new_frame[6]);
+        encode_signed_vb5(new_lat, &new_frame[1]);
+        encode_signed_vb5(new_lon, &new_frame[6]);
         fwrite(new_frame, 1, sizeof(new_frame), fout);
     }
 
