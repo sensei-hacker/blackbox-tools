@@ -133,7 +133,7 @@ Options:
 
 ```
 Original home:  lat=-33.3134811  lon= 149.0948991
-Random offset: lat +3.2145000  lon  -8.5120000
+Applied offset: lat +3.2145000  lon  -8.5120000
 Redacted home:  lat=-30.0989811  lon= 140.5828991
 ```
 

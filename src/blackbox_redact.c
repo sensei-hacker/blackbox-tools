@@ -29,10 +29,13 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <limits.h>
-#include <getopt.h>
 
-#ifndef WIN32
-#include <unistd.h>
+#ifdef WIN32
+    #include <io.h>
+    #include "getopt.h"
+#else
+    #include <unistd.h>
+    #include <getopt.h>
 #endif
 
 #include "parser.h"
@@ -84,7 +87,7 @@ static int32_t normalize_lat(int64_t lat)
 
 static int32_t normalize_lon(int64_t lon)
 {
-    /* Wrap into (-180°, +180°] range */
+    /* Wrap into [-180°, +180°) range */
     lon = ((lon + 1800000000LL) % 3600000000LL);
     if (lon < 0) lon += 3600000000LL;
     lon -= 1800000000LL;
@@ -107,10 +110,11 @@ static void on_frame_ready(flightLog_t *log, bool frameValid, int64_t *frame,
         return;
 
     if (h_frame_count >= MAX_H_FRAMES) {
-        if (h_frame_count == MAX_H_FRAMES)
+        if (h_frame_count == MAX_H_FRAMES) {
             fprintf(stderr, "Warning: more than %d H-frames; extras will not be redacted\n",
                     MAX_H_FRAMES);
-        h_frame_count++;   /* keep counting so the warning fires only once */
+            h_frame_count = MAX_H_FRAMES + 1;   /* sentinel: warning already shown */
+        }
         return;
     }
 
@@ -448,6 +452,12 @@ int main(int argc, char **argv)
 
 done:
     fclose(fin);
+
+    if (ferror(fout)) {
+        fprintf(stderr, "Error writing to '%s'\n", output_path);
+        fclose(fout);
+        return 1;
+    }
     fclose(fout);
 
     fprintf(stderr, "Done — %d GPS home frame(s) redacted.\n", h_frame_count);
